@@ -5,15 +5,24 @@ import { ContextManager } from './ContextManager.js';
 import { OutputRenderer } from '../output/OutputRenderer.js';
 import { UsageTracker } from '../output/UsageTracker.js';
 import { Logger } from '../logger/Logger.js';
+import { PermissionGuard } from '../permissions/PermissionGuard.js';
+import { ToolDispatcher } from '../tools/ToolDispatcher.js';
+import { ReadFileTool } from '../tools/ReadFileTool.js';
+import { WriteFileTool } from '../tools/WriteFileTool.js';
+import { BashTool } from '../tools/BashTool.js';
+import { GlobTool } from '../tools/GlobTool.js';
+import { GrepTool } from '../tools/GrepTool.js';
+import { EditFileTool } from '../tools/EditFileTool.js';
 
-/** Maximum tool-call depth per turn (rate limiter, F17). */
-const MAX_TOOL_CALLS_PER_TURN = 25;
+/** Pending tool call collected during streaming. */
+interface PendingToolCall {
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
 
-/**
- * Minimal tool result — Phase 1 has no real tools.
- * Phase 2 replaces this with the full ToolDispatcher result.
- */
-interface ToolResult {
+/** Tool result to append to context after dispatch. */
+interface ToolCallResult {
   toolUseId: string;
   content: string;
   isError: boolean;
@@ -25,9 +34,8 @@ interface ToolResult {
  * - Created once per process at startup.
  * - Holds the single ContextManager reference and reassigns it on every turn.
  * - Drives the agentic loop: stream → collect tool_use → dispatch → re-query.
- * - Phase 1: no real tool dispatch; tool_use events are acknowledged but not executed.
- * - Phase 2: PermissionGuard + ToolDispatcher injected here.
- * - Phase 4: AgentManager injected here for system prompt composition.
+ * - PermissionGuard gates destructive tool calls (write_file, edit_file, bash).
+ * - ToolDispatcher routes calls to the correct tool implementation.
  */
 export class ConversationController {
   private readonly config: ResolvedConfig;
@@ -35,7 +43,12 @@ export class ConversationController {
   private readonly renderer: OutputRenderer;
   private readonly usage: UsageTracker;
   private readonly logger: Logger;
+  private readonly guard: PermissionGuard;
+  private readonly dispatcher: ToolDispatcher;
   private context: ContextManager;
+
+  /** Total tool calls in the current user turn. Reset in handleInput(). */
+  private toolCallsThisTurn = 0;
 
   constructor(
     config: ResolvedConfig,
@@ -50,10 +63,19 @@ export class ConversationController {
       client ??
       new AnthropicClient({
         apiKey: config.apiKey,
-        // baseURL is omitted when apiUrl is undefined — SDK uses its default.
         ...(config.apiUrl !== undefined ? { baseURL: config.apiUrl } : {}),
       });
     this.logger = Logger.getInstance(config.debug);
+    this.guard = new PermissionGuard(config.permissionMode);
+
+    this.dispatcher = new ToolDispatcher();
+    this.dispatcher.register(new ReadFileTool());
+    this.dispatcher.register(new WriteFileTool());
+    this.dispatcher.register(new BashTool());
+    this.dispatcher.register(new GlobTool());
+    this.dispatcher.register(new GrepTool());
+    this.dispatcher.register(new EditFileTool());
+
     this.context = new ContextManager();
   }
 
@@ -61,11 +83,12 @@ export class ConversationController {
    * Handle one user turn.
    *
    * 1. Append user message.
-   * 2. Run agentic loop (stream → optional tool calls → re-query).
+   * 2. Run agentic loop (stream → tool dispatch → re-query).
    * 3. Record turn.
    * 4. Check if compaction is needed.
    */
   async handleInput(userText: string): Promise<void> {
+    this.toolCallsThisTurn = 0;
     this.context = this.context.append({ role: 'user', content: userText });
 
     this.logger.debug('handleInput', {
@@ -73,13 +96,12 @@ export class ConversationController {
       estimatedTokens: this.context.estimatedTokenCount,
     });
 
-    await this.runAgenticLoop(0);
+    await this.runAgenticLoop();
 
     this.usage.recordTurn();
 
-    // maybeCompactAsync() returns `this` when below threshold — no allocation.
     this.context = await this.context.maybeCompactAsync(
-      this.client['client'] as Anthropic, // Internal SDK client for compaction.
+      this.client['client'] as Anthropic,
       this.config.model,
     );
   }
@@ -111,31 +133,18 @@ export class ConversationController {
   /**
    * Inner streaming + tool-dispatch loop.
    *
-   * Recurses when the model returns tool_use blocks (up to MAX_TOOL_CALLS_PER_TURN).
-   * Returns when the model emits message_stop with no pending tool calls,
-   * or when the tool call depth limit is reached.
-   *
-   * @param depth - Recursion depth; used to enforce the tool call rate limit.
+   * Streams from the API, collects tool_use blocks, dispatches them with
+   * permission checks, appends results, then re-queries if tools were called.
+   * Stops when no tool calls are returned or the tool call limit is reached.
    */
-  private async runAgenticLoop(depth: number): Promise<void> {
-    if (depth >= MAX_TOOL_CALLS_PER_TURN) {
-      this.renderer.printError(
-        `Tool call limit (${MAX_TOOL_CALLS_PER_TURN}) reached. Stopping agentic loop.`,
-      );
-      return;
-    }
-
+  private async runAgenticLoop(): Promise<void> {
     const messages = this.context.snapshot as Anthropic.MessageParam[];
     const systemPrompt = this.buildSystemPrompt();
-
-    // Phase 1: no tools available yet (added in Phase 2).
-    const tools: Anthropic.Tool[] = [];
+    const tools = this.dispatcher.allDefinitions();
 
     // Collect assistant content blocks for appending after the stream ends.
-    // Use ContentBlockParam (the input type) rather than ContentBlock (the output type)
-    // because we are constructing messages to send back to the API.
     const assistantBlocks: Anthropic.ContentBlockParam[] = [];
-    const toolResults: ToolResult[] = [];
+    const pendingToolCalls: PendingToolCall[] = [];
 
     this.logger.debug('API stream start', {
       model: this.config.model,
@@ -155,23 +164,18 @@ export class ConversationController {
           break;
 
         case 'tool_use':
-          // Phase 1: acknowledge tool calls but do not execute them.
-          // Phase 2 replaces this block with real PermissionGuard + ToolDispatcher.
           this.renderer.flush();
           this.renderer.printToolCall(event.name, event.input);
-          this.renderer.printInfo('[Tool execution not yet implemented — Phase 2]');
-
           assistantBlocks.push({
             type: 'tool_use' as const,
             id: event.id,
             name: event.name,
             input: event.input,
           });
-
-          toolResults.push({
-            toolUseId: event.id,
-            content: 'Tool execution not yet implemented.',
-            isError: true,
+          pendingToolCalls.push({
+            id: event.id,
+            name: event.name,
+            input: event.input as Record<string, unknown>,
           });
           break;
 
@@ -190,35 +194,104 @@ export class ConversationController {
 
         case 'error':
           this.renderer.printError(event.message);
-          this.logger.error('Stream error', { message: event.message, retryable: event.retryable });
+          this.logger.error('Stream error', {
+            message: event.message,
+            retryable: event.retryable,
+          });
           return;
       }
     }
 
-    // Merge all text deltas into a single text block for storage.
-    // Storing every delta individually would bloat the context unnecessarily.
+    // Merge consecutive text deltas into a single block for storage.
     const mergedAssistantContent = this.mergeTextBlocks(assistantBlocks);
 
     this.context = this.context.append({
       role: 'assistant',
-      // ContentBlockParam[] is assignable to MessageParam content for assistant role.
       content: mergedAssistantContent as Anthropic.MessageParam['content'],
     });
 
-    // If there were tool calls, append tool results and recurse.
-    if (toolResults.length > 0) {
-      this.context = this.context.append({
-        role: 'user',
-        content: toolResults.map((r) => ({
-          type: 'tool_result' as const,
-          tool_use_id: r.toolUseId,
-          content: r.content,
-          is_error: r.isError,
-        })),
-      });
-
-      await this.runAgenticLoop(depth + 1);
+    if (pendingToolCalls.length === 0) {
+      return;
     }
+
+    // Dispatch tool calls sequentially (after streaming completes).
+    const toolResults: ToolCallResult[] = [];
+
+    for (const call of pendingToolCalls) {
+      this.toolCallsThisTurn++;
+
+      if (this.toolCallsThisTurn > this.config.maxToolCalls) {
+        this.renderer.printError(
+          `Tool call limit (${String(this.config.maxToolCalls)}) reached. Stopping agentic loop.`,
+        );
+        toolResults.push({
+          toolUseId: call.id,
+          content: `Tool call limit (${String(this.config.maxToolCalls)}) reached.`,
+          isError: true,
+        });
+        continue;
+      }
+
+      const result = await this.dispatchWithPermission(call);
+      this.renderer.printToolResult(result.content, result.isError);
+      toolResults.push({
+        toolUseId: call.id,
+        content: result.content,
+        isError: result.isError,
+      });
+    }
+
+    // Append all tool results as a single user message.
+    this.context = this.context.append({
+      role: 'user',
+      content: toolResults.map((r) => ({
+        type: 'tool_result' as const,
+        tool_use_id: r.toolUseId,
+        content: r.content,
+        is_error: r.isError,
+      })),
+    });
+
+    // Recurse to get the model's response to the tool results.
+    await this.runAgenticLoop();
+  }
+
+  /**
+   * Check permission and dispatch a single tool call.
+   * Builds a diff preview for file-modification tools before prompting.
+   */
+  private async dispatchWithPermission(call: PendingToolCall): Promise<ToolCallResult> {
+    // Get diff preview for tools that support it (write_file, edit_file).
+    let diffPreview: string | undefined;
+    if (this.guard.riskOf(call.name) === 'destructive') {
+      diffPreview = await this.dispatcher.getDiffPreview(
+        call.name,
+        call.input,
+        this.config.workingDirectory,
+      );
+    }
+
+    const summary = this.buildToolSummary(call.name, call.input);
+    const allowed = await this.guard.check(call.name, summary, diffPreview);
+
+    if (!allowed) {
+      return {
+        toolUseId: call.id,
+        content: `Operation denied by user.`,
+        isError: false,
+      };
+    }
+
+    const result = await this.dispatcher.dispatch(
+      call.name,
+      call.input,
+      this.config.workingDirectory,
+    );
+    return {
+      toolUseId: call.id,
+      content: result.content,
+      isError: result.isError,
+    };
   }
 
   // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -239,10 +312,29 @@ export class ConversationController {
     ].join('\n');
   }
 
+  /** Build a one-line description of a tool call for the permission prompt. */
+  private buildToolSummary(name: string, input: Record<string, unknown>): string {
+    switch (name) {
+      case 'read_file':
+        return `Read "${String(input['path'] ?? '')}"`;
+      case 'write_file':
+        return `Write to "${String(input['path'] ?? '')}"`;
+      case 'edit_file':
+        return `Edit "${String(input['file_path'] ?? '')}"`;
+      case 'bash':
+        return `Run: ${String(input['command'] ?? '').slice(0, 80)}`;
+      case 'glob':
+        return `Glob: ${String(input['pattern'] ?? '')}`;
+      case 'grep':
+        return `Grep: ${String(input['pattern'] ?? '')}`;
+      default:
+        return `Call ${name}`;
+    }
+  }
+
   /**
    * Merge consecutive text blocks into a single text block.
    * Non-text blocks (tool_use) are kept as-is.
-   * This keeps the stored assistant message compact.
    */
   private mergeTextBlocks(
     blocks: Anthropic.ContentBlockParam[],
