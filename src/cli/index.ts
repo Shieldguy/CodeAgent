@@ -6,25 +6,19 @@ import { ConversationController } from '../conversation/ConversationController.j
 import { OutputRenderer } from '../output/OutputRenderer.js';
 import { UsageTracker } from '../output/UsageTracker.js';
 import { Logger } from '../logger/Logger.js';
+import { SlashCommandEngine } from '../commands/SlashCommandEngine.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/**
- * Print a concise session summary to stdout.
- * Called on Ctrl+D. /exit routes through SlashCommandEngine (Phase 3).
- */
 function printUsageSummary(usage: UsageTracker): void {
   const { turnCount, totalInputTokens, totalOutputTokens } = usage.summary();
   process.stdout.write(
     `\nSession ended.\n` +
-      `  Turns: ${turnCount}\n` +
-      `  Tokens used: ${totalInputTokens} in / ${totalOutputTokens} out\n`,
+      `  Turns: ${String(turnCount)}\n` +
+      `  Tokens used: ${String(totalInputTokens)} in / ${String(totalOutputTokens)} out\n`,
   );
 }
 
-/**
- * Read all of stdin to a string (used for piped/headless mode, F13).
- */
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) {
@@ -69,7 +63,9 @@ export async function main(): Promise<void> {
 
     usage = new UsageTracker();
     renderer = new OutputRenderer(config.debug, config.color);
-    controller = new ConversationController(config, renderer, usage);
+
+    // Use static factory for async initialization (loads git context).
+    controller = await ConversationController.create(config, renderer, usage);
   } catch (error) {
     process.stderr.write(
       `Startup failed: ${error instanceof Error ? error.message : String(error)}\n`,
@@ -77,7 +73,9 @@ export async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // ── 3. Headless / piped mode (F13) ────────────────────────────────────────
+  const engine = new SlashCommandEngine();
+
+  // ── 3. Headless / piped mode ──────────────────────────────────────────────
   let headlessPrompt: string | undefined;
 
   if (args.prompt !== undefined) {
@@ -103,7 +101,7 @@ export async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // ── 4. Interactive REPL (F1) ──────────────────────────────────────────────
+  // ── 4. Interactive REPL ───────────────────────────────────────────────────
   renderer.printWelcome(args.agent ?? 'default');
 
   const rl = readline.createInterface({
@@ -119,14 +117,12 @@ export async function main(): Promise<void> {
     rl.prompt();
   };
 
-  // Ctrl+C — abort in-flight stream, do NOT exit (F1 spec).
   rl.on('SIGINT', () => {
     controller.abort();
     process.stdout.write('\n(aborted)\n');
     prompt();
   });
 
-  // Ctrl+D / EOF — print summary then exit.
   rl.on('close', () => {
     printUsageSummary(usage);
     process.exit(0);
@@ -144,7 +140,6 @@ export async function main(): Promise<void> {
     buffer = result.next;
 
     if (result.value === null) {
-      // Still in paste mode — show continuation prompt.
       rl.resume();
       prompt();
       return;
@@ -158,21 +153,20 @@ export async function main(): Promise<void> {
       return;
     }
 
-    // All slash commands (including /exit) route through ConversationController →
-    // SlashCommandEngine (Phase 3). For Phase 1, /clear is handled inline here.
-    if (input === '/clear') {
-      controller.reset();
-      renderer.printInfo('Context cleared.');
-      rl.resume();
-      prompt();
-      return;
-    }
+    // Dispatch to slash command engine first.
+    // Returns true if handled (even with error), false for plain text.
+    const ctx = controller.getCommandContext();
+    const handled = await engine.execute(input, ctx).catch((err: unknown) => {
+      renderer.printError(err instanceof Error ? err.message : String(err));
+      return true;
+    });
 
-    try {
-      await controller.handleInput(input);
-    } catch (error) {
-      // Per-turn errors keep the session alive.
-      renderer.printError(error instanceof Error ? error.message : String(error));
+    if (!handled) {
+      try {
+        await controller.handleInput(input);
+      } catch (error) {
+        renderer.printError(error instanceof Error ? error.message : String(error));
+      }
     }
 
     rl.resume();

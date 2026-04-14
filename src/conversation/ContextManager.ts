@@ -101,6 +101,14 @@ export class ContextManager {
   }
 
   /**
+   * Force compaction regardless of the token threshold.
+   * Called by the /compact slash command.
+   */
+  async forceCompact(client: Anthropic, model: string): Promise<ContextManager> {
+    return this.compact(client, model);
+  }
+
+  /**
    * Compact: summarize old messages, keep the recent tail verbatim.
    *
    * Strategy:
