@@ -256,16 +256,16 @@ describe('ConversationController', () => {
     expect(systemPrompt).toContain('/my/project');
   });
 
-  // ── agent model override ─────────────────────────────────────────────────────
+  // ── model resolution ─────────────────────────────────────────────────────────
 
-  it('uses agent model override when active agent has a model', async () => {
+  it('uses config.model when agent has no model override', async () => {
     const streamFn = vi.fn(async function* () {
       yield { type: 'usage', inputTokens: 5, outputTokens: 2 } as StreamEvent;
       yield { type: 'message_stop' } as StreamEvent;
     });
     const client = { stream: streamFn, abort: vi.fn(), client: {} } as unknown as AnthropicClient;
     const ctrl = new ConversationController(
-      makeConfig({ agent: 'code-reviewer' }),
+      makeConfig({ model: 'claude-sonnet-4-6', agent: 'code-reviewer' }),
       renderer,
       usage,
       makeAgentManager('code-reviewer'),
@@ -274,9 +274,9 @@ describe('ConversationController', () => {
 
     await ctrl.handleInput('review this');
 
-    // The model passed to stream() should be the agent's model override.
+    // Built-in agents have no model override — falls back to config.model.
     const modelArg = (streamFn.mock.calls[0] as unknown[])[3] as string;
-    expect(modelArg).toBe('claude-opus-4-6'); // code-reviewer's model
+    expect(modelArg).toBe('claude-sonnet-4-6');
   });
 
   // ── tool filtering ───────────────────────────────────────────────────────────

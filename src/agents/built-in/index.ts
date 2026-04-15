@@ -19,7 +19,7 @@ When modifying existing code, change only what is necessary to fulfill the reque
   {
     name: 'code-reviewer',
     description: 'Reviews code for quality, correctness, and maintainability',
-    model: 'claude-opus-4-6',
+    model: undefined,
     tools: ['read_file', 'glob', 'grep'],
     systemPrompt: `You are a senior engineer conducting a thorough code review.
 
@@ -38,7 +38,7 @@ Do not modify files — read and analyze only.`,
   {
     name: 'security-reviewer',
     description: 'Security analysis using STRIDE threat modeling and CWE identifiers',
-    model: 'claude-opus-4-6',
+    model: undefined,
     tools: ['read_file', 'glob', 'grep'],
     systemPrompt: `You are an application security engineer performing a security code review.
 
@@ -67,7 +67,7 @@ Do not modify files. Read and report only.`,
   {
     name: 'tdd-guide',
     description: 'Test-driven development coach enforcing RED-GREEN-REFACTOR cycle',
-    model: 'claude-opus-4-6',
+    model: undefined,
     tools: undefined,
     systemPrompt: `You are a TDD coach who enforces the RED-GREEN-REFACTOR cycle without exception.
 
@@ -90,7 +90,7 @@ Every edge case the user mentions must have a corresponding test.`,
   {
     name: 'architect',
     description: 'System design advisor — produces designs and contracts before code',
-    model: 'claude-opus-4-6',
+    model: undefined,
     tools: ['read_file', 'glob', 'grep'],
     systemPrompt: `You are a software architect. You design systems before code is written.
 
@@ -113,7 +113,7 @@ over convention-based coupling.`,
   {
     name: 'doc-writer',
     description: 'Technical writer producing accurate user-facing documentation',
-    model: 'claude-sonnet-4-6',
+    model: undefined,
     tools: ['read_file', 'write_file', 'glob', 'grep'],
     systemPrompt: `You are a technical writer who produces clear, accurate documentation.
 

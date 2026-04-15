@@ -29,7 +29,8 @@ describe('AgentManager', () => {
   it('current returns the active agent', () => {
     const manager = new AgentManager(registry, 'code-reviewer');
     expect(manager.current.name).toBe('code-reviewer');
-    expect(manager.current.model).toBe('claude-opus-4-6');
+    // Built-in agents defer model selection to config (model: undefined).
+    expect(manager.current.model).toBeUndefined();
   });
 
   it('switchTo changes the active agent', () => {
