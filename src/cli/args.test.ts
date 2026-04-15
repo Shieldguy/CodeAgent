@@ -6,10 +6,15 @@ describe('parseArgs', () => {
     const args = parseArgs([]);
     expect(args.debug).toBe(false);
     expect(args.noColor).toBe(false);
+    expect(args.resume).toBe(false);
     expect(args.apiKey).toBeUndefined();
     expect(args.model).toBeUndefined();
     expect(args.prompt).toBeUndefined();
     expect(args.workingDirectory).toBeUndefined();
+  });
+
+  it('parses --resume', () => {
+    expect(parseArgs(['--resume']).resume).toBe(true);
   });
 
   it('parses --api-key', () => {

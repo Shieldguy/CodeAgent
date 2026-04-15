@@ -16,7 +16,11 @@ export class AgentCommand implements SlashCommand {
         const isCurrent = agent.name === ctx.activeAgentName;
         const marker = isCurrent ? ' ✓' : '';
         const model = agent.model !== undefined ? ` _(model: ${agent.model})_` : '';
-        lines.push(`- **${agent.name}**${marker} — ${agent.description}${model}`);
+        const tools =
+          agent.tools !== undefined
+            ? ` _(tools: ${agent.tools.join(', ')})_`
+            : '';
+        lines.push(`- **${agent.name}**${marker} — ${agent.description}${model}${tools}`);
       }
 
       ctx.renderer.print(lines.join('\n'));

@@ -31,7 +31,9 @@ function makeCtx(overrides: Partial<CommandContext> = {}): CommandContext {
     } as unknown as UsageTracker,
     clearMessages: vi.fn(),
     switchAgent: vi.fn().mockResolvedValue(undefined),
-    listAgents: vi.fn().mockReturnValue([{ name: 'default', description: 'Default' }]),
+    listAgents: vi.fn().mockReturnValue([
+      { name: 'default', description: 'Default', systemPrompt: 'You are default.' },
+    ]),
     compact: vi.fn().mockResolvedValue(undefined),
     exportSession: vi.fn().mockResolvedValue('/tmp/export.md'),
     exit: vi.fn() as unknown as CommandContext['exit'],

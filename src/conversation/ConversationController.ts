@@ -18,7 +18,10 @@ import { GrepTool } from '../tools/GrepTool.js';
 import { EditFileTool } from '../tools/EditFileTool.js';
 import { loadProjectContextSync } from '../context/ProjectContextLoader.js';
 import { loadGitContext, type GitContext } from '../context/GitContextLoader.js';
-import type { CommandContext, AgentDefinition } from '../commands/types.js';
+import { AgentRegistry } from '../agents/AgentRegistry.js';
+import { AgentManager } from '../agents/AgentManager.js';
+import { SessionHistory, type SessionStats } from './SessionHistory.js';
+import type { CommandContext } from '../commands/types.js';
 
 /** Pending tool call collected during streaming. */
 interface PendingToolCall {
@@ -37,12 +40,10 @@ interface ToolCallResult {
 /**
  * ConversationController is the session orchestrator.
  *
- * - Created once per process at startup.
- * - Holds the single ContextManager reference and reassigns it on every turn.
+ * - Created once per process at startup via the static `create()` factory.
+ * - Holds ContextManager, AgentManager, SessionHistory.
  * - Drives the agentic loop: stream → collect tool_use → dispatch → re-query.
  * - Exposes getCommandContext() for the SlashCommandEngine.
- *
- * Use the static `create()` factory to get async initialization (git context).
  */
 export class ConversationController {
   private readonly config: ResolvedConfig;
@@ -52,6 +53,8 @@ export class ConversationController {
   private readonly logger: Logger;
   private readonly guard: PermissionGuard;
   private readonly dispatcher: ToolDispatcher;
+  private readonly agentManager: AgentManager;
+  private readonly sessionHistory: SessionHistory;
 
   /** Injected from CLAUDE.md at startup. Empty string if file not found. */
   private readonly projectContext: string;
@@ -68,11 +71,13 @@ export class ConversationController {
     config: ResolvedConfig,
     renderer: OutputRenderer,
     usage: UsageTracker,
+    agentManager: AgentManager,
     client?: AnthropicClient,
   ) {
     this.config = config;
     this.renderer = renderer;
     this.usage = usage;
+    this.agentManager = agentManager;
     this.client =
       client ??
       new AnthropicClient({
@@ -104,12 +109,13 @@ export class ConversationController {
       this.logger.debug('No CLAUDE.md found', { path: projectResult.filePath });
     }
 
+    this.sessionHistory = new SessionHistory();
     this.context = new ContextManager();
   }
 
   /**
-   * Static factory — preferred over `new` when async initialization is needed.
-   * Loads git context in addition to the synchronous initialization.
+   * Static factory — preferred over `new`.
+   * Loads git context, initializes session history, and loads agents.
    */
   static async create(
     config: ResolvedConfig,
@@ -117,8 +123,14 @@ export class ConversationController {
     usage: UsageTracker,
     client?: AnthropicClient,
   ): Promise<ConversationController> {
-    const ctrl = new ConversationController(config, renderer, usage, client);
+    // Build the agent registry and manager.
+    const registry = new AgentRegistry();
+    await registry.load(config.workingDirectory);
+    const agentManager = new AgentManager(registry, config.agent);
+
+    const ctrl = new ConversationController(config, renderer, usage, agentManager, client);
     await ctrl.loadGitContextAsync();
+    await ctrl.sessionHistory.init();
     return ctrl;
   }
 
@@ -141,11 +153,7 @@ export class ConversationController {
 
   /**
    * Handle one user turn.
-   *
-   * 1. Append user message.
-   * 2. Run agentic loop (stream → tool dispatch → re-query).
-   * 3. Record turn.
-   * 4. Check if compaction is needed.
+   * Saves session to disk after each turn for crash recovery.
    */
   async handleInput(userText: string): Promise<void> {
     this.toolCallsThisTurn = 0;
@@ -164,6 +172,11 @@ export class ConversationController {
       this.client['client'] as Anthropic,
       this.config.model,
     );
+
+    // Save session for crash recovery (best-effort, errors are suppressed).
+    await this.sessionHistory
+      .save(this.context.snapshot, this.buildSessionStats(), this.activeModel(), this.agentManager.current.name)
+      .catch(() => undefined);
   }
 
   /** Abort the current in-flight API stream (called by SIGINT handler). */
@@ -182,29 +195,43 @@ export class ConversationController {
     return this.context.turnCount;
   }
 
+  /** Write the final session record with endedAt. Call on clean exit. */
+  async shutdown(): Promise<void> {
+    await this.sessionHistory.finalize(
+      this.context.snapshot,
+      this.buildSessionStats(),
+      this.activeModel(),
+      this.agentManager.current.name,
+    );
+  }
+
   /**
    * Export the current conversation to a Markdown file.
    * Writes to ~/.codeagent/exports/<ISO-timestamp>.md.
    * Returns the file path.
    */
   async exportSession(): Promise<string> {
+    const { SessionExporter } = await import('./SessionExporter.js');
     const timestamp = new Date().toISOString().replace(/:/g, '-').replace(/\./g, '-');
     const dir = path.join(os.homedir(), '.codeagent', 'exports');
     await fs.mkdir(dir, { recursive: true });
     const filePath = path.join(dir, `${timestamp}.md`);
 
-    const lines = ['# CodeAgent Session Export\n'];
-    for (const msg of this.context.snapshot) {
-      const role = msg.role === 'assistant' ? 'Assistant' : 'User';
-      const content =
-        typeof msg.content === 'string'
-          ? msg.content
-          : JSON.stringify(msg.content, null, 2);
-      lines.push(`## ${role}\n\n${content}\n`);
-    }
+    const markdown = SessionExporter.toMarkdown(this.context.snapshot, this.buildSessionStats(), {
+      model: this.activeModel(),
+      agent: this.agentManager.current.name,
+    });
 
-    await fs.writeFile(filePath, lines.join('\n'), 'utf8');
+    await fs.writeFile(filePath, markdown, 'utf8');
     return filePath;
+  }
+
+  /**
+   * Restore conversation history from a previous session (--resume flag).
+   * Must be called before the first handleInput().
+   */
+  restoreMessages(messages: readonly Anthropic.MessageParam[]): void {
+    this.context = ContextManager.fromMessages(messages);
   }
 
   /**
@@ -212,15 +239,18 @@ export class ConversationController {
    * Called once per REPL line before slash command dispatch.
    */
   getCommandContext(): CommandContext {
-    // Capture references to avoid `this` in closures.
     const ctrl = this;
 
     return {
       get messages() {
         return ctrl.context.snapshot as readonly Anthropic.MessageParam[];
       },
-      activeAgentName: this.config.agent,
-      currentModel: this.config.model,
+      get activeAgentName() {
+        return ctrl.agentManager.current.name;
+      },
+      get currentModel() {
+        return ctrl.activeModel();
+      },
       get turnCount() {
         return ctrl.context.turnCount;
       },
@@ -231,14 +261,17 @@ export class ConversationController {
         ctrl.reset();
       },
 
-      async switchAgent(_name: string): Promise<void> {
-        // Phase 4: AgentManager will handle this.
-        throw new Error('Agent switching not yet available (Phase 4).');
+      switchAgent(name: string): Promise<void> {
+        try {
+          ctrl.agentManager.switchTo(name);
+        } catch (error) {
+          return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+        }
+        return Promise.resolve();
       },
 
-      listAgents(): AgentDefinition[] {
-        // Phase 4: AgentRegistry will populate this.
-        return [{ name: ctrl.config.agent, description: 'Default agent' }];
+      listAgents() {
+        return ctrl.agentManager.listAll();
       },
 
       async compact(): Promise<void> {
@@ -253,6 +286,8 @@ export class ConversationController {
       },
 
       exit(code?: number): never {
+        // Fire-and-forget finalize — we're exiting anyway.
+        void ctrl.shutdown();
         process.exit(code ?? 0);
       },
     };
@@ -263,22 +298,19 @@ export class ConversationController {
   private async runAgenticLoop(): Promise<void> {
     const messages = this.context.snapshot as Anthropic.MessageParam[];
     const systemPrompt = this.buildSystemPrompt();
-    const tools = this.dispatcher.allDefinitions();
+    const tools = this.activeToolDefinitions();
+    const model = this.activeModel();
 
     const assistantBlocks: Anthropic.ContentBlockParam[] = [];
     const pendingToolCalls: PendingToolCall[] = [];
 
     this.logger.debug('API stream start', {
-      model: this.config.model,
+      model,
       messageCount: messages.length,
+      agent: this.agentManager.current.name,
     });
 
-    for await (const event of this.client.stream(
-      messages,
-      tools,
-      systemPrompt,
-      this.config.model,
-    )) {
+    for await (const event of this.client.stream(messages, tools, systemPrompt, model)) {
       switch (event.type) {
         case 'text_delta':
           this.renderer.streamChunk(event.text);
@@ -302,9 +334,9 @@ export class ConversationController {
           break;
 
         case 'usage':
-          this.usage.record(this.config.model, event.inputTokens, event.outputTokens);
+          this.usage.record(model, event.inputTokens, event.outputTokens);
           this.logger.debug('Token usage', {
-            model: this.config.model,
+            model,
             inputTokens: event.inputTokens,
             outputTokens: event.outputTokens,
           });
@@ -392,6 +424,36 @@ export class ConversationController {
     return { toolUseId: call.id, content: result.content, isError: result.isError };
   }
 
+  // ── Tool filtering ────────────────────────────────────────────────────────
+
+  private activeToolDefinitions() {
+    const all = this.dispatcher.allDefinitions();
+    const allowlist = this.agentManager.current.tools;
+    if (allowlist === undefined) return all;
+    const allowed = new Set(allowlist);
+    return all.filter((t) => allowed.has(t.name));
+  }
+
+  // ── Model resolution ──────────────────────────────────────────────────────
+
+  private activeModel(): string {
+    return this.agentManager.current.model ?? this.config.model;
+  }
+
+  // ── Session stats ─────────────────────────────────────────────────────────
+
+  private buildSessionStats(): SessionStats {
+    const summary = this.usage.summary();
+    return {
+      startedAt: this.sessionHistory.startedAt,
+      turnCount: summary.turnCount,
+      totalInputTokens: summary.totalInputTokens,
+      totalOutputTokens: summary.totalOutputTokens,
+      estimatedCostUsd: summary.estimatedCostUsd,
+      agentsUsed: this.agentManager.agentsUsed(),
+    };
+  }
+
   // ── System prompt ─────────────────────────────────────────────────────────
 
   /**
@@ -401,16 +463,16 @@ export class ConversationController {
    *   1. Working directory + current date
    *   2. Project instructions (CLAUDE.md) — if present
    *   3. Git context — if available
-   *   4. Agent persona (Phase 4: from AgentManager; Phase 3: inline)
+   *   4. Active agent persona
+   *   5. Tool constraint note — if agent has a restricted allowlist
    */
   private buildSystemPrompt(): string {
     const sections: string[] = [];
+    const agent = this.agentManager.current;
 
     // Section 1: Working directory and date.
     const date = new Date().toISOString().split('T')[0] ?? '';
-    sections.push(
-      `Working directory: ${this.config.workingDirectory}\nToday's date: ${date}`,
-    );
+    sections.push(`Working directory: ${this.config.workingDirectory}\nToday's date: ${date}`);
 
     // Section 2: Project instructions from CLAUDE.md.
     if (this.projectContext.trim()) {
@@ -423,14 +485,14 @@ export class ConversationController {
     }
 
     // Section 4: Agent persona.
-    sections.push(
-      `## Agent Persona\n\nYou are CodeAgent, an AI coding assistant. ` +
-        `You help developers read, understand, and modify code. ` +
-        `You have access to tools for reading files, writing files, ` +
-        `running shell commands, searching code, and editing files.\n\n` +
-        `Always explain what you are about to do before using a tool. ` +
-        `When editing files, prefer surgical edits over full rewrites.`,
-    );
+    sections.push(agent.systemPrompt);
+
+    // Section 5: Tool constraint note.
+    if (agent.tools !== undefined) {
+      sections.push(
+        `Note: In this session you have access only to these tools: ${agent.tools.join(', ')}.`,
+      );
+    }
 
     return sections.join('\n\n---\n\n');
   }

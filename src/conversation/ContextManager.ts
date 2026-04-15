@@ -82,6 +82,14 @@ export class ContextManager {
     return new ContextManager([]);
   }
 
+  /**
+   * Create a ContextManager pre-populated with an existing message history.
+   * Used by the --resume flow to restore a previous session.
+   */
+  static fromMessages(messages: readonly Anthropic.MessageParam[]): ContextManager {
+    return new ContextManager([...messages]);
+  }
+
   // ── Compaction (F12, F27) ────────────────────────────────────────────────────
 
   /**

@@ -3,6 +3,7 @@ import { parseArgs } from './args.js';
 import { InputBuffer } from './InputBuffer.js';
 import { ConfigManager } from '../config/ConfigManager.js';
 import { ConversationController } from '../conversation/ConversationController.js';
+import { SessionHistory } from '../conversation/SessionHistory.js';
 import { OutputRenderer } from '../output/OutputRenderer.js';
 import { UsageTracker } from '../output/UsageTracker.js';
 import { Logger } from '../logger/Logger.js';
@@ -64,7 +65,7 @@ export async function main(): Promise<void> {
     usage = new UsageTracker();
     renderer = new OutputRenderer(config.debug, config.color);
 
-    // Use static factory for async initialization (loads git context).
+    // Use static factory for async initialization (agents, git context, session history).
     controller = await ConversationController.create(config, renderer, usage);
   } catch (error) {
     process.stderr.write(
@@ -73,9 +74,23 @@ export async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // ── 3. Resume previous session if requested ───────────────────────────────
+  if (args.resume) {
+    const lastSession = await SessionHistory.loadLast();
+    if (lastSession === undefined) {
+      process.stderr.write('No previous session found to resume.\n');
+    } else {
+      controller.restoreMessages(lastSession.messages);
+      process.stdout.write(
+        `Resumed session from ${lastSession.startedAt} ` +
+          `(${String(lastSession.stats.turnCount)} turns, agent: ${lastSession.agent})\n`,
+      );
+    }
+  }
+
   const engine = new SlashCommandEngine();
 
-  // ── 3. Headless / piped mode ──────────────────────────────────────────────
+  // ── 4. Headless / piped mode ──────────────────────────────────────────────
   let headlessPrompt: string | undefined;
 
   if (args.prompt !== undefined) {
@@ -98,10 +113,11 @@ export async function main(): Promise<void> {
       );
       process.exit(1);
     }
+    await controller.shutdown();
     process.exit(0);
   }
 
-  // ── 4. Interactive REPL ───────────────────────────────────────────────────
+  // ── 5. Interactive REPL ───────────────────────────────────────────────────
   renderer.printWelcome(args.agent ?? 'default');
 
   const rl = readline.createInterface({
@@ -123,8 +139,9 @@ export async function main(): Promise<void> {
     prompt();
   });
 
-  rl.on('close', () => {
+  rl.on('close', async () => {
     printUsageSummary(usage);
+    await controller.shutdown();
     process.exit(0);
   });
 
@@ -154,7 +171,6 @@ export async function main(): Promise<void> {
     }
 
     // Dispatch to slash command engine first.
-    // Returns true if handled (even with error), false for plain text.
     const ctx = controller.getCommandContext();
     const handled = await engine.execute(input, ctx).catch((err: unknown) => {
       renderer.printError(err instanceof Error ? err.message : String(err));

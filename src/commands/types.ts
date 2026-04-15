@@ -1,13 +1,10 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import type { OutputRenderer } from '../output/OutputRenderer.js';
 import type { UsageTracker } from '../output/UsageTracker.js';
+import type { AgentDefinition } from '../agents/types.js';
 
-/** Minimal agent definition for command context. Expanded in Phase 4. */
-export interface AgentDefinition {
-  name: string;
-  description: string;
-  model?: string | undefined;
-}
+// Re-export for consumers that import from this module.
+export type { AgentDefinition };
 
 /**
  * The full context passed to every slash command.

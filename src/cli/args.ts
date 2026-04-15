@@ -8,6 +8,8 @@ export interface CliArgs {
   agent?: string | undefined;
   /** Set when --prompt / -p / bare positional provided. Enables headless mode. */
   prompt?: string | undefined;
+  /** If true, load the most recent session from history before starting the REPL. */
+  resume: boolean;
   debug: boolean;
   /** True when --no-color is passed. */
   noColor: boolean;
@@ -25,6 +27,7 @@ const RawArgsSchema = z.object({
   permissionMode: z.enum(PERMISSION_MODES).optional(),
   agent: z.string().optional(),
   prompt: z.string().optional(),
+  resume: z.boolean(),
   debug: z.boolean(),
   noColor: z.boolean(),
   workingDirectory: z.string().optional(),
@@ -51,6 +54,7 @@ export function parseArgs(argv: string[] = process.argv.slice(2)): CliArgs {
   const raw: Record<string, unknown> = {
     debug: false,
     noColor: false,
+    resume: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -84,6 +88,9 @@ export function parseArgs(argv: string[] = process.argv.slice(2)): CliArgs {
         break;
       case '--api-url':
         raw['apiUrl'] = argv[++i];
+        break;
+      case '--resume':
+        raw['resume'] = true;
         break;
       case '--version':
       case '-v': {
