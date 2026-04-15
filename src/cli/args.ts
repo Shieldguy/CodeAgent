@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { createRequire } from 'node:module';
+import { VERSION } from '../version.js';
 
 export interface CliArgs {
   apiKey?: string | undefined;
@@ -93,13 +93,10 @@ export function parseArgs(argv: string[] = process.argv.slice(2)): CliArgs {
         raw['resume'] = true;
         break;
       case '--version':
-      case '-v': {
-        const require = createRequire(import.meta.url);
-        const pkg = require('../../package.json') as { version: string };
-        process.stdout.write(`codeagent ${pkg.version}\n`);
+      case '-v':
+        process.stdout.write(`codeagent ${VERSION}\n`);
         process.exit(0);
         break;
-      }
       default:
         if (arg === undefined) break;
         if (!arg.startsWith('-') && raw['prompt'] === undefined) {

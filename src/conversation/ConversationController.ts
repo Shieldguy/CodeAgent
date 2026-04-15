@@ -21,6 +21,7 @@ import { loadGitContext, type GitContext } from '../context/GitContextLoader.js'
 import { AgentRegistry } from '../agents/AgentRegistry.js';
 import { AgentManager } from '../agents/AgentManager.js';
 import { SessionHistory, type SessionStats } from './SessionHistory.js';
+import { SessionExporter } from './SessionExporter.js';
 import type { CommandContext } from '../commands/types.js';
 
 /** Pending tool call collected during streaming. */
@@ -211,7 +212,6 @@ export class ConversationController {
    * Returns the file path.
    */
   async exportSession(): Promise<string> {
-    const { SessionExporter } = await import('./SessionExporter.js');
     const timestamp = new Date().toISOString().replace(/:/g, '-').replace(/\./g, '-');
     const dir = path.join(os.homedir(), '.codeagent', 'exports');
     await fs.mkdir(dir, { recursive: true });
