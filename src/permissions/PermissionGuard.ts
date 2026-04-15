@@ -1,5 +1,8 @@
 import * as readline from 'node:readline';
 
+/** Function signature for asking a single question and returning the answer. */
+export type AskFn = (question: string) => Promise<string>;
+
 /**
  * The three permission modes, matching the --permission-mode CLI flag values.
  *
@@ -43,9 +46,26 @@ export class PermissionGuard {
    */
   private queue: Promise<void>;
 
+  /**
+   * Optional injected ask function.
+   * When set (via setAskFn), used instead of opening a new readline interface.
+   * This avoids double-echo when the REPL's readline is already open on stdin.
+   */
+  private askFn: AskFn | null = null;
+
   constructor(mode: PermissionMode) {
     this.mode = mode;
     this.queue = Promise.resolve();
+  }
+
+  /**
+   * Inject an external ask function so the permission prompt shares the
+   * REPL's readline interface instead of creating a second one on stdin.
+   *
+   * Must be called before any destructive tool prompt occurs.
+   */
+  setAskFn(fn: AskFn): void {
+    this.askFn = fn;
   }
 
   /** Read-only accessor for the current mode. */
@@ -136,10 +156,18 @@ export class PermissionGuard {
   }
 
   /**
-   * Open a temporary readline interface to ask a single question.
-   * Uses a separate interface from the main REPL to avoid event handler conflicts.
+   * Ask a single question and return the user's answer.
+   *
+   * Uses the injected askFn (REPL's readline) when available.
+   * Falls back to opening a temporary readline interface only when running
+   * outside an interactive REPL (e.g., headless / test contexts).
    */
   private ask(question: string): Promise<string> {
+    if (this.askFn !== null) {
+      return this.askFn(question);
+    }
+
+    // Fallback: create a temporary readline (no second TTY conflict in headless mode).
     return new Promise<string>((resolve) => {
       const rl = readline.createInterface({
         input: process.stdin,

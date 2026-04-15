@@ -185,6 +185,16 @@ export class ConversationController {
     this.client.abort();
   }
 
+  /**
+   * Inject the REPL's readline question function into the permission guard.
+   * Call this once after the REPL readline interface is created so that
+   * permission prompts reuse it instead of opening a second stdin reader
+   * (which causes double-echo in interactive mode).
+   */
+  setPermissionAskFn(fn: (question: string) => Promise<string>): void {
+    this.guard.setAskFn(fn);
+  }
+
   /** Reset conversation history to empty (called by /clear). */
   reset(): void {
     this.context = this.context.reset();

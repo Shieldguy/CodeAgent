@@ -126,6 +126,12 @@ export async function main(): Promise<void> {
     terminal: true,
   });
 
+  // Share the REPL's readline with the permission guard so that destructive-tool
+  // approval prompts don't open a second interface on stdin (which causes double-echo).
+  controller.setPermissionAskFn(
+    (question) => new Promise<string>((resolve) => rl.question(question, resolve)),
+  );
+
   let buffer = new InputBuffer();
 
   const prompt = (): void => {
