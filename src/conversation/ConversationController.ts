@@ -366,24 +366,44 @@ export class ConversationController {
 
     const toolResults: ToolCallResult[] = [];
 
-    for (const call of pendingToolCalls) {
-      this.toolCallsThisTurn++;
+    try {
+      for (const call of pendingToolCalls) {
+        this.toolCallsThisTurn++;
 
-      if (this.toolCallsThisTurn > this.config.maxToolCalls) {
-        this.renderer.printError(
-          `Tool call limit (${String(this.config.maxToolCalls)}) reached. Stopping agentic loop.`,
-        );
-        toolResults.push({
-          toolUseId: call.id,
-          content: `Tool call limit (${String(this.config.maxToolCalls)}) reached.`,
-          isError: true,
-        });
-        continue;
+        if (this.toolCallsThisTurn > this.config.maxToolCalls) {
+          this.renderer.printError(
+            `Tool call limit (${String(this.config.maxToolCalls)}) reached. Stopping agentic loop.`,
+          );
+          toolResults.push({
+            toolUseId: call.id,
+            content: `Tool call limit (${String(this.config.maxToolCalls)}) reached.`,
+            isError: true,
+          });
+          continue;
+        }
+
+        const result = await this.dispatchWithPermission(call);
+        this.renderer.printToolResult(result.content, result.isError);
+        toolResults.push(result);
       }
-
-      const result = await this.dispatchWithPermission(call);
-      this.renderer.printToolResult(result.content, result.isError);
-      toolResults.push(result);
+    } catch (dispatchError) {
+      // If dispatch throws unexpectedly, synthesise error results for any
+      // tool_use blocks that were not yet resolved.  This guarantees the
+      // Anthropic API invariant: every tool_use in the assistant message
+      // must be immediately followed by a matching tool_result.
+      const dispatchedIds = new Set(toolResults.map((r) => r.toolUseId));
+      const errMsg =
+        dispatchError instanceof Error ? dispatchError.message : String(dispatchError);
+      this.logger.error('Tool dispatch error', { error: errMsg });
+      for (const call of pendingToolCalls) {
+        if (!dispatchedIds.has(call.id)) {
+          toolResults.push({
+            toolUseId: call.id,
+            content: `Tool dispatch failed: ${errMsg}`,
+            isError: true,
+          });
+        }
+      }
     }
 
     this.context = this.context.append({
